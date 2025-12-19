@@ -145,7 +145,7 @@ cli
 	)
 	.option(
 		"--source <source>",
-		"Source: git URL or local folder path. Examples: https://github.com/user/repo.git, ./local-kit. If not specified, uses GitHub releases (requires GitHub CLI)",
+		"Source: git URL or local folder path. Examples: https://github.com/user/repo.git, ./local-kit. Default: https://github.com/toanpv-0639/claudekit-engineer",
 	)
 	.option("--ref <ref>", "Git ref (branch, tag, or commit) when using git source")
 	.option("--force", "Overwrite existing files without confirmation")
@@ -181,7 +181,7 @@ cli
 	)
 	.option(
 		"--source <source>",
-		"Source: git URL or local folder path. Examples: https://github.com/user/repo.git, ./local-kit. If not specified, uses GitHub releases (requires GitHub CLI)",
+		"Source: git URL or local folder path (default: https://github.com/toanpv-0639/claudekit-engineer). Examples: https://github.com/user/repo.git, ./local-kit",
 	)
 	.option("--ref <ref>", "Git ref (branch, tag, or commit) when using git source")
 	.option("--exclude <pattern>", "Exclude files matching glob pattern (can be used multiple times)")

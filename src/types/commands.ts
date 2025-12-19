@@ -66,7 +66,7 @@ export const UpdateCommandOptionsSchema = z
 		dir: z.string().default("."),
 		kit: KitType.optional(),
 		release: z.string().optional(),
-		source: z.string().optional(), // Source: git URL, local path, or kit name (default: github)
+		source: z.string().default("https://github.com/toanpv-0639/claudekit-engineer"), // Default source for init command
 		ref: z.string().optional(), // Git ref (branch, tag, or commit) when using git source
 		exclude: z.array(ExcludePatternSchema).optional().default([]),
 		only: z.array(ExcludePatternSchema).optional().default([]),

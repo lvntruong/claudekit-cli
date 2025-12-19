@@ -116,11 +116,12 @@ export async function initCommand(options: UpdateCommandOptions): Promise<void> 
 		// Load config for defaults
 		const config = await ConfigManager.get();
 
-		// Determine source type - only use --source flag, not kit name
+		// Determine source type - use --source flag (has default value now)
+		// Default source is set in schema: https://github.com/toanpv-0639/claudekit-engineer
 		const sourceInput = validOptions.source;
 		const sourceType = sourceInput
 			? DownloadManager.detectSourceType(sourceInput)
-			: "github"; // Default to GitHub releases if no --source specified
+			: "git"; // Default source is git URL, so default type is "git"
 
 		logger.verbose("Source detection", { sourceInput, sourceType });
 
