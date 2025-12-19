@@ -43,6 +43,8 @@ export const NewCommandOptionsSchema = z
 		dir: z.string().default("."),
 		kit: KitType.optional(),
 		release: z.string().optional(),
+		source: z.string().optional(), // Source: git URL, local path, or kit name (default: github)
+		ref: z.string().optional(), // Git ref (branch, tag, or commit) when using git source
 		force: z.boolean().default(false),
 		exclude: z.array(ExcludePatternSchema).optional().default([]),
 		opencode: z.boolean().default(false),
@@ -64,6 +66,8 @@ export const UpdateCommandOptionsSchema = z
 		dir: z.string().default("."),
 		kit: KitType.optional(),
 		release: z.string().optional(),
+		source: z.string().optional(), // Source: git URL, local path, or kit name (default: github)
+		ref: z.string().optional(), // Git ref (branch, tag, or commit) when using git source
 		exclude: z.array(ExcludePatternSchema).optional().default([]),
 		only: z.array(ExcludePatternSchema).optional().default([]),
 		global: z.boolean().default(false),

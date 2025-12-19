@@ -5,6 +5,9 @@
 // Archive types
 export type ArchiveType = "tar.gz" | "zip";
 
+// Kit source types
+export type KitSourceType = "github" | "local" | "git";
+
 // Download progress
 export interface DownloadProgress {
 	total: number;

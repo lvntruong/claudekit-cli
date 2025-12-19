@@ -42,17 +42,31 @@ export async function newCommand(options: NewCommandOptions): Promise<void> {
 		// Load config for defaults
 		const config = await ConfigManager.get();
 
-		// Get kit selection
-		let kit = validOptions.kit || config.defaults?.kit;
-		if (!kit) {
-			if (isNonInteractive) {
-				throw new Error("Kit must be specified via --kit flag in non-interactive mode");
-			}
-			kit = await prompts.selectKit();
-		}
+		// Determine source type - only use --source flag, not kit name
+		const sourceInput = validOptions.source;
+		const sourceType = sourceInput
+			? DownloadManager.detectSourceType(sourceInput)
+			: "github"; // Default to GitHub releases if no --source specified
 
-		const kitConfig = AVAILABLE_KITS[kit];
-		logger.info(`Selected kit: ${kitConfig.name}`);
+		logger.verbose("Source detection", { sourceInput, sourceType });
+
+		// Get kit selection (only needed for GitHub source)
+		let kit = validOptions.kit || config.defaults?.kit;
+		let kitConfig: typeof AVAILABLE_KITS[keyof typeof AVAILABLE_KITS] | null = null;
+		let releaseTag: string | undefined = undefined;
+
+		if (sourceType === "github") {
+			// Only prompt for kit if using GitHub releases (not git/local sources)
+			if (!kit) {
+				if (isNonInteractive) {
+					throw new Error("Kit must be specified via --kit flag in non-interactive mode");
+				}
+				kit = await prompts.selectKit();
+			}
+
+			kitConfig = AVAILABLE_KITS[kit];
+			logger.info(`Selected kit: ${kitConfig.name}`);
+		}
 
 		// Get target directory
 		let targetDir = validOptions.dir || config.defaults?.dir || ".";
@@ -91,89 +105,6 @@ export async function newCommand(options: NewCommandOptions): Promise<void> {
 			}
 		}
 
-		// Initialize GitHub client
-		const github = new GitHubClient();
-
-		// Check repository access
-		const spinner = createSpinner("Checking repository access...").start();
-		logger.verbose("GitHub API check", { repo: kitConfig.repo, owner: kitConfig.owner });
-		try {
-			await github.checkAccess(kitConfig);
-			spinner.succeed("Repository access verified");
-		} catch (error: any) {
-			spinner.fail("Access denied to repository");
-			// Display detailed error message (includes PAT troubleshooting)
-			logger.error(error.message || `Cannot access ${kitConfig.name}`);
-			return;
-		}
-
-		// Determine version selection strategy
-		let selectedVersion: string | undefined = validOptions.release;
-
-		// Validate non-interactive mode requires explicit version
-		if (!selectedVersion && isNonInteractive) {
-			throw new Error(
-				"Interactive version selection unavailable in non-interactive mode. " +
-					"Either: (1) use --release <tag> flag, or (2) set CI=false to enable interactive mode",
-			);
-		}
-
-		// Interactive version selection if no explicit version and in interactive mode
-		if (!selectedVersion && !isNonInteractive) {
-			logger.info("Fetching available versions...");
-
-			try {
-				const versionResult = await prompts.selectVersionEnhanced({
-					kit: kitConfig,
-					includePrereleases: validOptions.beta,
-					limit: 10,
-					allowManualEntry: true,
-					forceRefresh: validOptions.refresh,
-				});
-
-				if (!versionResult) {
-					logger.warning("Version selection cancelled by user");
-					return;
-				}
-
-				selectedVersion = versionResult;
-				logger.success(`Selected version: ${selectedVersion}`);
-			} catch (error: any) {
-				logger.error("Failed to fetch versions, using latest release");
-				logger.debug(`Version selection error: ${error.message}`);
-				// Fall back to latest (default behavior)
-				selectedVersion = undefined;
-			}
-		}
-
-		// Get release
-		let release;
-		if (selectedVersion) {
-			release = await github.getReleaseByTag(kitConfig, selectedVersion);
-		} else {
-			if (validOptions.beta) {
-				logger.info("Fetching latest beta release...");
-			} else {
-				logger.info("Fetching latest release...");
-			}
-			release = await github.getLatestRelease(kitConfig, validOptions.beta);
-			// Only show "Found release" when fetching latest (user didn't select specific version)
-			if (release.prerelease) {
-				logger.success(`Found beta: ${release.tag_name}`);
-			} else {
-				logger.success(`Found: ${release.tag_name}`);
-			}
-		}
-
-		// Get downloadable asset (custom asset or GitHub tarball)
-		const downloadInfo = GitHubClient.getDownloadableAsset(release);
-		logger.verbose("Release info", {
-			tag: release.tag_name,
-			prerelease: release.prerelease,
-			downloadType: downloadInfo.type,
-			assetSize: downloadInfo.size,
-		});
-
 		output.section("Downloading");
 
 		// Download asset
@@ -185,50 +116,186 @@ export async function newCommand(options: NewCommandOptions): Promise<void> {
 		}
 
 		const tempDir = await downloadManager.createTempDir();
+		let extractDir: string;
+		let release: { tag_name: string; prerelease?: boolean; tarball_url?: string } | null = null;
 
-		// Get authentication token for API requests
-		const { token } = await AuthManager.getToken();
-
-		let archivePath: string;
-		try {
-			// Try downloading the asset/tarball with authentication
-			archivePath = await downloadManager.downloadFile({
-				url: downloadInfo.url,
-				name: downloadInfo.name,
-				size: downloadInfo.size,
-				destDir: tempDir,
-				token, // Always pass token for private repository access
-			});
-		} catch (error) {
-			// If asset download fails, fallback to GitHub tarball
-			if (downloadInfo.type === "asset") {
-				logger.warning("Asset download failed, falling back to GitHub tarball...");
-				const tarballInfo = {
-					type: "github-tarball" as const,
-					url: release.tarball_url,
-					name: `${kitConfig.repo}-${release.tag_name}.tar.gz`,
-					size: 0, // Size unknown for tarball
-				};
-
-				archivePath = await downloadManager.downloadFile({
-					url: tarballInfo.url,
-					name: tarballInfo.name,
-					size: tarballInfo.size,
-					destDir: tempDir,
-					token,
-				});
-			} else {
-				throw error;
+		if (sourceType === "github") {
+			// GitHub source - use existing logic
+			if (!kitConfig) {
+				throw new Error("Kit config is required for GitHub source");
 			}
+
+			// Initialize GitHub client
+			const github = new GitHubClient();
+
+			// Check repository access
+			const spinner = createSpinner("Checking repository access...").start();
+			logger.verbose("GitHub API check", { repo: kitConfig.repo, owner: kitConfig.owner });
+			try {
+				await github.checkAccess(kitConfig);
+				spinner.succeed("Repository access verified");
+			} catch (error: any) {
+				spinner.fail("Access denied to repository");
+				// Display detailed error message (includes PAT troubleshooting)
+				logger.error(error.message || `Cannot access ${kitConfig.name}`);
+				return;
+			}
+
+			// Determine version selection strategy
+			let selectedVersion: string | undefined = validOptions.release;
+
+			// Validate non-interactive mode requires explicit version
+			if (!selectedVersion && isNonInteractive) {
+				throw new Error(
+					"Interactive version selection unavailable in non-interactive mode. " +
+						"Either: (1) use --release <tag> flag, or (2) set CI=false to enable interactive mode",
+				);
+			}
+
+			// Interactive version selection if no explicit version and in interactive mode
+			if (!selectedVersion && !isNonInteractive) {
+				logger.info("Fetching available versions...");
+
+				try {
+					const versionResult = await prompts.selectVersionEnhanced({
+						kit: kitConfig,
+						includePrereleases: validOptions.beta,
+						limit: 10,
+						allowManualEntry: true,
+						forceRefresh: validOptions.refresh,
+					});
+
+					if (!versionResult) {
+						logger.warning("Version selection cancelled by user");
+						return;
+					}
+
+					selectedVersion = versionResult;
+					logger.success(`Selected version: ${selectedVersion}`);
+				} catch (error: any) {
+					logger.error("Failed to fetch versions, using latest release");
+					logger.debug(`Version selection error: ${error.message}`);
+					// Fall back to latest (default behavior)
+					selectedVersion = undefined;
+				}
+			}
+
+			// Get release
+			let release;
+			if (selectedVersion) {
+				release = await github.getReleaseByTag(kitConfig, selectedVersion);
+			} else {
+				if (validOptions.beta) {
+					logger.info("Fetching latest beta release...");
+				} else {
+					logger.info("Fetching latest release...");
+				}
+				release = await github.getLatestRelease(kitConfig, validOptions.beta);
+				// Only show "Found release" when fetching latest (user didn't select specific version)
+				if (release.prerelease) {
+					logger.success(`Found beta: ${release.tag_name}`);
+				} else {
+					logger.success(`Found: ${release.tag_name}`);
+				}
+			}
+
+			releaseTag = release.tag_name;
+
+			// Get downloadable asset (custom asset or GitHub tarball)
+			const downloadInfo = GitHubClient.getDownloadableAsset(release);
+			logger.verbose("Release info", {
+				tag: release.tag_name,
+				prerelease: release.prerelease,
+				downloadType: downloadInfo.type,
+				assetSize: downloadInfo.size,
+			});
+
+			// Get authentication token for API requests
+			const { token } = await AuthManager.getToken();
+
+			let archivePath: string;
+			try {
+				// Try downloading the asset/tarball with authentication
+				archivePath = await downloadManager.downloadFile({
+					url: downloadInfo.url,
+					name: downloadInfo.name,
+					size: downloadInfo.size,
+					destDir: tempDir,
+					token, // Always pass token for private repository access
+				});
+			} catch (error) {
+				// If asset download fails, fallback to GitHub tarball
+				if (downloadInfo.type === "asset") {
+					logger.warning("Asset download failed, falling back to GitHub tarball...");
+					const tarballInfo = {
+						type: "github-tarball" as const,
+						url: release.tarball_url,
+						name: `${kitConfig.repo}-${release.tag_name}.tar.gz`,
+						size: 0, // Size unknown for tarball
+					};
+
+					archivePath = await downloadManager.downloadFile({
+						url: tarballInfo.url,
+						name: tarballInfo.name,
+						size: tarballInfo.size,
+						destDir: tempDir,
+						token,
+					});
+				} else {
+					throw error;
+				}
+			}
+
+			// Extract archive
+			extractDir = `${tempDir}/extracted`;
+			logger.verbose("Extraction", { archivePath, extractDir });
+			await downloadManager.extractArchive(archivePath, extractDir);
+
+			// Validate extraction (strict mode for GitHub releases)
+			await downloadManager.validateExtraction(extractDir, true);
+		} else if (sourceType === "git") {
+			// Git repository source
+			if (!sourceInput) {
+				throw new Error("Git repository URL is required when using git source");
+			}
+
+			extractDir = `${tempDir}/cloned`;
+			await downloadManager.cloneFromGit(sourceInput, extractDir, validOptions.ref);
+			// Validate extraction (non-strict mode for git sources)
+			await downloadManager.validateExtraction(extractDir, false);
+			releaseTag = validOptions.ref || "HEAD";
+			// Create a default release object for git source
+			release = {
+				tag_name: releaseTag,
+				prerelease: false,
+			};
+		} else if (sourceType === "local") {
+			// Local folder source
+			if (!sourceInput) {
+				throw new Error("Local folder path is required when using local source");
+			}
+
+			extractDir = `${tempDir}/copied`;
+			await downloadManager.copyFromLocal(sourceInput, extractDir);
+			// Validate extraction (non-strict mode for local sources)
+			await downloadManager.validateExtraction(extractDir, false);
+			releaseTag = "local";
+			// Create a default release object for local source
+			release = {
+				tag_name: releaseTag,
+				prerelease: false,
+			};
+		} else {
+			throw new Error(`Unsupported source type: ${sourceType}`);
 		}
 
-		// Extract archive
-		const extractDir = `${tempDir}/extracted`;
-		logger.verbose("Extraction", { archivePath, extractDir });
-		await downloadManager.extractArchive(archivePath, extractDir);
-
-		// Validate extraction
-		await downloadManager.validateExtraction(extractDir);
+		// Ensure release object exists (should always be set by now)
+		if (!release) {
+			release = {
+				tag_name: releaseTag || "unknown",
+				prerelease: false,
+			};
+		}
 
 		// Apply /ck: prefix if requested
 		if (CommandsPrefix.shouldApplyPrefix(validOptions)) {
@@ -335,10 +402,11 @@ export async function newCommand(options: NewCommandOptions): Promise<void> {
 		trackingSpinner.succeed(`Tracked ${trackResult.success} files`);
 
 		// Write manifest
+		const kitName = kitConfig?.name || "ClaudeKit";
 		await manifestWriter.writeManifest(
 			claudeDir,
-			kitConfig.name,
-			release.tag_name,
+			kitName,
+			releaseTag || "unknown",
 			"local", // new command is always local
 		);
 

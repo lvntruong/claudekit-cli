@@ -143,6 +143,11 @@ cli
 		"-r, --release <version>",
 		"Skip version selection, use specific version (e.g., latest, v1.0.0)",
 	)
+	.option(
+		"--source <source>",
+		"Source: git URL or local folder path. Examples: https://github.com/user/repo.git, ./local-kit. If not specified, uses GitHub releases (requires GitHub CLI)",
+	)
+	.option("--ref <ref>", "Git ref (branch, tag, or commit) when using git source")
 	.option("--force", "Overwrite existing files without confirmation")
 	.option("--exclude <pattern>", "Exclude files matching glob pattern (can be used multiple times)")
 	.option("--opencode", "Install OpenCode CLI package (non-interactive mode)")
@@ -174,6 +179,11 @@ cli
 		"-r, --release <version>",
 		"Skip version selection, use specific version (e.g., latest, v1.0.0)",
 	)
+	.option(
+		"--source <source>",
+		"Source: git URL or local folder path. Examples: https://github.com/user/repo.git, ./local-kit. If not specified, uses GitHub releases (requires GitHub CLI)",
+	)
+	.option("--ref <ref>", "Git ref (branch, tag, or commit) when using git source")
 	.option("--exclude <pattern>", "Exclude files matching glob pattern (can be used multiple times)")
 	.option(
 		"--only <pattern>",

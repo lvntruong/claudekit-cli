@@ -14,6 +14,7 @@ import { type ArchiveType, DownloadError, ExtractionError, type GitHubReleaseAss
 import extractZip from "extract-zip";
 import ignore from "ignore";
 import * as tar from "tar";
+import { copy, stat } from "fs-extra";
 
 export class DownloadManager {
 	/**
@@ -742,9 +743,11 @@ export class DownloadManager {
 
 	/**
 	 * Validate extraction results
+	 * @param extractDir - Directory to validate
+	 * @param strict - If true, require .claude directory. If false, only check if directory is not empty (for local/git sources)
 	 * @throws {ExtractionError} If validation fails
 	 */
-	async validateExtraction(extractDir: string): Promise<void> {
+	async validateExtraction(extractDir: string, strict: boolean = true): Promise<void> {
 		const { readdir, access } = await import("node:fs/promises");
 		const { join: pathJoin } = await import("node:path");
 		const { constants } = await import("node:fs");
@@ -758,25 +761,29 @@ export class DownloadManager {
 				throw new ExtractionError("Extraction resulted in no files");
 			}
 
-			// Verify critical paths exist
-			const criticalPaths = [".claude", "CLAUDE.md"];
-			const missingPaths: string[] = [];
+			// Verify critical paths exist (only in strict mode for GitHub releases)
+			if (strict) {
+				const criticalPaths = [".claude", "CLAUDE.md"];
+				const missingPaths: string[] = [];
 
-			for (const path of criticalPaths) {
-				try {
-					await access(pathJoin(extractDir, path), constants.F_OK);
-					logger.debug(`✓ Found: ${path}`);
-				} catch {
-					logger.warning(`Expected path not found: ${path}`);
-					missingPaths.push(path);
+				for (const path of criticalPaths) {
+					try {
+						await access(pathJoin(extractDir, path), constants.F_OK);
+						logger.debug(`✓ Found: ${path}`);
+					} catch {
+						logger.warning(`Expected path not found: ${path}`);
+						missingPaths.push(path);
+					}
 				}
-			}
 
-			// Warn if critical paths are missing but don't fail validation
-			if (missingPaths.length > 0) {
-				logger.warning(
-					`Some expected paths are missing: ${missingPaths.join(", ")}. This may not be a ClaudeKit project.`,
-				);
+				// Warn if critical paths are missing but don't fail validation
+				if (missingPaths.length > 0) {
+					logger.warning(
+						`Some expected paths are missing: ${missingPaths.join(", ")}. This may not be a ClaudeKit project.`,
+					);
+				}
+			} else {
+				logger.debug("Validation in non-strict mode (local/git source)");
 			}
 
 			logger.debug("Extraction validation passed");
@@ -852,5 +859,285 @@ export class DownloadManager {
 		const i = Math.floor(Math.log(bytes) / Math.log(k));
 
 		return `${Math.round((bytes / k ** i) * 100) / 100} ${sizes[i]}`;
+	}
+
+	/**
+	 * Clone kit from git repository
+	 * @param repoUrl - Git repository URL (https://github.com/owner/repo.git or git@github.com:owner/repo.git)
+	 * @param destDir - Destination directory to clone into
+	 * @param ref - Optional git ref (branch, tag, or commit hash). Defaults to default branch
+	 * @returns Path to cloned directory (contents moved to destDir)
+	 */
+	async cloneFromGit(repoUrl: string, destDir: string, ref?: string): Promise<string> {
+		const spinner = createSpinner("Cloning repository...").start();
+
+		const { readdir, stat, rm } = await import("node:fs/promises");
+		const { join: pathJoin } = await import("node:path");
+
+		try {
+			// Clone into a temporary parent directory (git clone creates a subdirectory with repo name)
+			const tempParentDir = `${destDir}-temp-clone`;
+			await mkdir(tempParentDir, { recursive: true });
+
+			// Extract repo name from URL for better error handling
+			const repoNameMatch = repoUrl.match(/([^/]+)\.git$/);
+			const expectedRepoName = repoNameMatch ? repoNameMatch[1] : null;
+
+			// Use execFile with array arguments to prevent command injection
+			// Clone repository (git will create a subdirectory)
+			// Note: git clone creates subdirectory in current working directory
+			let cloneCommand: string[];
+			if (ref && /^[a-f0-9]{7,40}$/i.test(ref)) {
+				// For commit hash, clone full repo then checkout
+				cloneCommand = ["clone", repoUrl];
+			} else if (ref) {
+				// For branch/tag, use --branch flag
+				cloneCommand = ["clone", "--depth", "1", "--branch", ref, repoUrl];
+			} else {
+				// Default branch
+				cloneCommand = ["clone", "--depth", "1", repoUrl];
+			}
+
+			logger.verbose("Running git clone", { command: `git ${cloneCommand.join(" ")}`, cwd: tempParentDir });
+
+			// Execute git clone
+			await new Promise<void>((resolve, reject) => {
+				execFile("git", cloneCommand, {
+					cwd: tempParentDir,
+					timeout: 300_000, // 5 minutes timeout
+				}, (error, stdout, stderr) => {
+					if (error) {
+						logger.debug(`Git clone error: ${error.message}`);
+						logger.debug(`Git clone stderr: ${stderr}`);
+						reject(new DownloadError(`Git clone failed: ${error.message || stderr || "Unknown error"}`));
+						return;
+					}
+					logger.verbose("Git clone stdout", { stdout });
+					if (stderr) {
+						logger.debug("Git clone stderr", { stderr });
+					}
+					resolve();
+				});
+			});
+
+			// Check if clone was successful by reading directory
+			const entries = await readdir(tempParentDir, { encoding: "utf8" });
+			logger.debug(`Entries in temp directory after clone: ${entries.join(", ")}`);
+			
+			if (entries.length === 0) {
+				throw new DownloadError("Git clone resulted in empty directory. Check repository URL and access permissions.");
+			}
+
+			// For commit hash, checkout the specific commit
+			if (ref && /^[a-f0-9]{7,40}$/i.test(ref)) {
+				// Find the cloned directory first
+				let clonedDirName: string | null = null;
+				
+				// Try expected name first
+				if (expectedRepoName && entries.includes(expectedRepoName)) {
+					const expectedPath = pathJoin(tempParentDir, expectedRepoName);
+					const expectedStat = await stat(expectedPath);
+					if (expectedStat.isDirectory()) {
+						clonedDirName = expectedRepoName;
+					}
+				}
+				
+				// If not found, find first directory
+				if (!clonedDirName) {
+					for (const entry of entries) {
+						const entryPath = pathJoin(tempParentDir, entry);
+						try {
+							const entryStat = await stat(entryPath);
+							if (entryStat.isDirectory()) {
+								clonedDirName = entry;
+								break;
+							}
+						} catch {
+							// Continue
+						}
+					}
+				}
+				
+				if (!clonedDirName) {
+					throw new DownloadError("Could not find cloned repository directory");
+				}
+				
+				const clonedDirPath = pathJoin(tempParentDir, clonedDirName);
+				spinner.text = `Checking out commit ${ref}...`;
+				await new Promise<void>((resolve, reject) => {
+					execFile("git", ["checkout", ref], {
+						cwd: clonedDirPath,
+						timeout: 30_000, // 30 seconds timeout
+					}, (error, stdout, stderr) => {
+						if (error) {
+							logger.debug(`Git checkout error: ${error.message}`);
+							logger.debug(`Git checkout stderr: ${stderr}`);
+							reject(new DownloadError(`Git checkout failed: ${error.message || stderr || "Unknown error"}`));
+							return;
+						}
+						resolve();
+					});
+				});
+				
+				// Re-read entries after checkout (in case structure changed)
+				const entriesAfterCheckout = await readdir(tempParentDir, { encoding: "utf8" });
+				logger.debug(`Entries after checkout: ${entriesAfterCheckout.join(", ")}`);
+			}
+
+			// Find the cloned repository directory
+			let clonedRepoDir: string | null = null;
+			
+			// First try to find by expected name
+			if (expectedRepoName) {
+				const expectedPath = pathJoin(tempParentDir, expectedRepoName);
+				try {
+					const expectedStat = await stat(expectedPath);
+					if (expectedStat.isDirectory()) {
+						clonedRepoDir = expectedPath;
+					}
+				} catch {
+					// Expected path doesn't exist, continue
+				}
+			}
+
+			// If not found, look for directory with .git subdirectory
+			if (!clonedRepoDir) {
+				for (const entry of entries) {
+					const entryPath = pathJoin(tempParentDir, entry);
+					const entryStat = await stat(entryPath);
+					if (entryStat.isDirectory()) {
+						// Check if it's a git repository
+						try {
+							await stat(pathJoin(entryPath, ".git"));
+							clonedRepoDir = entryPath;
+							break;
+						} catch {
+							// Not a git repo, continue
+						}
+					}
+				}
+			}
+
+			// If still not found, use the first directory
+			if (!clonedRepoDir && entries.length === 1) {
+				const firstEntry = pathJoin(tempParentDir, entries[0]);
+				const firstStat = await stat(firstEntry);
+				if (firstStat.isDirectory()) {
+					clonedRepoDir = firstEntry;
+				}
+			}
+
+			if (!clonedRepoDir) {
+				throw new DownloadError("Could not find cloned repository directory");
+			}
+
+			logger.debug(`Found cloned repository at: ${clonedRepoDir}`);
+
+			// Move contents from cloned repo to destDir
+			await mkdir(destDir, { recursive: true });
+			await this.moveDirectoryContents(clonedRepoDir, destDir);
+
+			// Clean up temp clone directory
+			await rm(tempParentDir, { recursive: true, force: true });
+
+			spinner.succeed("Repository cloned successfully");
+			logger.debug(`Cloned repository contents moved to: ${destDir}`);
+
+			return destDir;
+		} catch (error) {
+			spinner.fail("Failed to clone repository");
+			// Clean up temp directory on error
+			try {
+				const tempCloneDir = `${destDir}-temp-clone`;
+				await rm(tempCloneDir, { recursive: true, force: true });
+			} catch {
+				// Ignore cleanup errors
+			}
+			throw new DownloadError(
+				`Failed to clone repository ${repoUrl}: ${error instanceof Error ? error.message : "Unknown error"}`,
+			);
+		}
+	}
+
+	/**
+	 * Copy kit from local folder
+	 * @param sourcePath - Path to local folder containing kit
+	 * @param destDir - Destination directory to copy to
+	 * @returns Path to copied directory
+	 */
+	async copyFromLocal(sourcePath: string, destDir: string): Promise<string> {
+		const spinner = createSpinner("Copying from local folder...").start();
+
+		try {
+			// Resolve source path to absolute
+			const resolvedSource = resolve(sourcePath);
+
+			// Check if source exists
+			const sourceStat = await stat(resolvedSource);
+			if (!sourceStat.isDirectory()) {
+				throw new DownloadError(`Source path is not a directory: ${resolvedSource}`);
+			}
+
+			// Ensure destination directory exists
+			await mkdir(destDir, { recursive: true });
+
+			logger.verbose("Copying local folder", { source: resolvedSource, dest: destDir });
+
+			// Copy directory contents
+			await copy(resolvedSource, destDir, {
+				filter: (src: string) => {
+					const relativePath = relative(resolvedSource, src);
+					// Apply exclude patterns
+					if (this.shouldExclude(relativePath)) {
+						logger.debug(`Excluding: ${relativePath}`);
+						return false;
+					}
+					return true;
+				},
+			});
+
+			spinner.succeed("Local folder copied successfully");
+			logger.debug(`Copied local folder to: ${destDir}`);
+
+			return destDir;
+		} catch (error) {
+			spinner.fail("Failed to copy local folder");
+			throw new DownloadError(
+				`Failed to copy from local folder ${sourcePath}: ${error instanceof Error ? error.message : "Unknown error"}`,
+			);
+		}
+	}
+
+	/**
+	 * Detect source type from input string
+	 * @param input - Input string (can be git URL, local path, or kit name)
+	 * @returns Detected source type
+	 */
+	static detectSourceType(input: string): "github" | "local" | "git" {
+		// Check if it's a git URL (http/https/git@)
+		if (
+			input.startsWith("http://") ||
+			input.startsWith("https://") ||
+			input.startsWith("git@") ||
+			input.endsWith(".git")
+		) {
+			return "git";
+		}
+
+		// Check if it's a local path
+		// Absolute paths start with /
+		// Relative paths start with ./ or ../ or contain path separators
+		if (
+			input.startsWith("/") ||
+			input.startsWith("./") ||
+			input.startsWith("../") ||
+			(input.includes("/") && !input.includes("://"))
+		) {
+			return "local";
+		}
+
+		// Default to GitHub (should not happen if --source is used correctly)
+		// But if user passes kit name like "engineer" as source, treat as GitHub
+		return "github";
 	}
 }
